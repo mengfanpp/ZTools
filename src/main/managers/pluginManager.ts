@@ -641,6 +641,42 @@ export class PluginManager {
   }
 
   /**
+   * 重新打开上次加载失败的插件页面。
+   * 开发服务器晚于主程序就绪时，首次预加载会失败；缓存视图若不重新导航，之后每次点击都会立即失败。
+   * @param plugin 已缓存的插件实例
+   * @returns 重新导航已发起后结束的 Promise；页面仍在加载或已经就绪时立即结束
+   */
+  private async reloadFailedPluginPage(plugin: PluginViewInfo): Promise<void> {
+    if (plugin.loading.isReady || plugin.view.webContents.isDestroyed()) return
+
+    // 进行中的导航不能打断；只有已经失败的结果才重新加载。
+    const outcome = await Promise.race([
+      plugin.loading.ready.then((ok) => ok),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 0))
+    ])
+    if (outcome !== false || plugin.view.webContents.isDestroyed()) return
+
+    const previousReady = plugin.loading.ready
+    const pluginConfig = this.readPluginConfig(plugin.path)
+    const { pluginUrl } = this.resolvePluginUrl(
+      plugin.path,
+      pluginConfig,
+      plugin.isDevelopment === true
+    )
+    console.log('[Plugin] 页面上次加载失败，重新加载:', { pluginPath: plugin.path, pluginUrl })
+    void plugin.view.webContents.loadURL(pluginUrl).catch((error) => {
+      console.error('[Plugin] 页面重新加载失败:', { pluginPath: plugin.path }, error)
+    })
+
+    // 等导航换成新的就绪等待，避免调用方读到上一次已经失败的 Promise。
+    const start = Date.now()
+    while (plugin.loading.ready === previousReady && Date.now() - start < 1000) {
+      if (plugin.view.webContents.isDestroyed()) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+
+  /**
    * 等待页面与运行模式就绪，再将仍有效的请求提交到主窗口。
    * @param plugin 已创建或缓存的插件实例
    * @param request 本次启动请求及不可变参数
@@ -654,6 +690,9 @@ export class PluginManager {
     cmdName?: string
   ): Promise<void> {
     const { view } = plugin
+    // 失败页不会自行恢复；再次打开时重新导航，让晚启动的开发服务器能够接上。
+    await this.reloadFailedPluginPage(plugin)
+    if (this.activeLaunch !== request) return
     let mode: string | undefined
     while (this.activeLaunch === request) {
       const documentReady = plugin.loading.ready
